@@ -305,9 +305,7 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
             arrow::datatypes::TimeUnit::Microsecond,
             None,
         )),
-        "duration" => Ok(DataType::Duration(
-            arrow::datatypes::TimeUnit::Microsecond,
-        )),
+        "duration" => Ok(DataType::Duration(arrow::datatypes::TimeUnit::Microsecond)),
 
         // String and Binary types
         "utf8" => Ok(DataType::Utf8),
@@ -677,11 +675,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("arrow_type_to_json failed for {:?}: {}", dt, e));
             let back = convert_json_arrow_type(&json)
                 .unwrap_or_else(|e| panic!("convert_json_arrow_type failed for {:?}: {}", dt, e));
-            assert_eq!(
-                &back, dt,
-                "Roundtrip mismatch for {:?}: got {:?}",
-                dt, back
-            );
+            assert_eq!(&back, dt, "Roundtrip mismatch for {:?}: got {:?}", dt, back);
         }
     }
 }
