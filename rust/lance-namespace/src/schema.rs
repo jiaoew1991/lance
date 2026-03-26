@@ -248,9 +248,12 @@ pub fn convert_json_arrow_field(json_field: &JsonArrowField) -> Result<Field> {
 
 /// Convert JsonArrowDataType to Arrow DataType
 pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType> {
+    use std::sync::Arc;
+
     let type_name = json_type.r#type.to_lowercase();
 
     match type_name.as_str() {
+        // Primitive types
         "null" => Ok(DataType::Null),
         "bool" | "boolean" => Ok(DataType::Boolean),
         "int8" => Ok(DataType::Int8),
@@ -261,10 +264,113 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
         "uint32" => Ok(DataType::UInt32),
         "int64" => Ok(DataType::Int64),
         "uint64" => Ok(DataType::UInt64),
+        "float16" => Ok(DataType::Float16),
         "float32" => Ok(DataType::Float32),
         "float64" => Ok(DataType::Float64),
+
+        // Decimal types
+        "decimal32" => {
+            let encoded = json_type.length.unwrap_or(0);
+            Ok(DataType::Decimal32(
+                (encoded / 1000) as u8,
+                (encoded % 1000) as i8,
+            ))
+        }
+        "decimal64" => {
+            let encoded = json_type.length.unwrap_or(0);
+            Ok(DataType::Decimal64(
+                (encoded / 1000) as u8,
+                (encoded % 1000) as i8,
+            ))
+        }
+        "decimal128" => {
+            let encoded = json_type.length.unwrap_or(0);
+            Ok(DataType::Decimal128(
+                (encoded / 1000) as u8,
+                (encoded % 1000) as i8,
+            ))
+        }
+        "decimal256" => {
+            let encoded = json_type.length.unwrap_or(0);
+            Ok(DataType::Decimal256(
+                (encoded / 1000) as u8,
+                (encoded % 1000) as i8,
+            ))
+        }
+
+        // Date/Time types
+        "date32" => Ok(DataType::Date32),
+        "date64" => Ok(DataType::Date64),
+        "timestamp" => Ok(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        )),
+        "duration" => Ok(DataType::Duration(
+            arrow::datatypes::TimeUnit::Microsecond,
+        )),
+
+        // String and Binary types
         "utf8" => Ok(DataType::Utf8),
+        "large_utf8" => Ok(DataType::LargeUtf8),
         "binary" => Ok(DataType::Binary),
+        "large_binary" => Ok(DataType::LargeBinary),
+        "fixed_size_binary" => {
+            let size = json_type.length.unwrap_or(0) as i32;
+            Ok(DataType::FixedSizeBinary(size))
+        }
+
+        // Nested types
+        "list" => {
+            let inner = json_type
+                .fields
+                .as_ref()
+                .and_then(|f| f.first())
+                .ok_or_else(|| Error::namespace("list type missing inner field"))?;
+            Ok(DataType::List(Arc::new(convert_json_arrow_field(inner)?)))
+        }
+        "large_list" => {
+            let inner = json_type
+                .fields
+                .as_ref()
+                .and_then(|f| f.first())
+                .ok_or_else(|| Error::namespace("large_list type missing inner field"))?;
+            Ok(DataType::LargeList(Arc::new(convert_json_arrow_field(
+                inner,
+            )?)))
+        }
+        "fixed_size_list" => {
+            let inner = json_type
+                .fields
+                .as_ref()
+                .and_then(|f| f.first())
+                .ok_or_else(|| Error::namespace("fixed_size_list type missing inner field"))?;
+            let size = json_type.length.unwrap_or(0) as i32;
+            Ok(DataType::FixedSizeList(
+                Arc::new(convert_json_arrow_field(inner)?),
+                size,
+            ))
+        }
+        "struct" => {
+            let fields = json_type
+                .fields
+                .as_ref()
+                .ok_or_else(|| Error::namespace("struct type missing fields"))?;
+            let arrow_fields: Result<Vec<Field>> =
+                fields.iter().map(convert_json_arrow_field).collect();
+            Ok(DataType::Struct(arrow_fields?.into()))
+        }
+        "map" => {
+            let entries = json_type
+                .fields
+                .as_ref()
+                .and_then(|f| f.first())
+                .ok_or_else(|| Error::namespace("map type missing entries field"))?;
+            Ok(DataType::Map(
+                Arc::new(convert_json_arrow_field(entries)?),
+                false,
+            ))
+        }
+
         _ => Err(Error::namespace(format!(
             "Unsupported Arrow type: {}",
             type_name
@@ -523,5 +629,59 @@ mod tests {
         // Test Float16
         let float16 = arrow_type_to_json(&DataType::Float16).unwrap();
         assert_eq!(float16.r#type, "float16");
+    }
+
+    /// Verify that convert_json_arrow_type (deserialization) is the inverse of
+    /// arrow_type_to_json (serialization) for all supported types.
+    #[test]
+    fn test_json_arrow_type_roundtrip() {
+        use arrow::datatypes::Field;
+
+        let cases: Vec<DataType> = vec![
+            // Scalars
+            DataType::Null,
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::UInt8,
+            DataType::Int16,
+            DataType::UInt16,
+            DataType::Int32,
+            DataType::UInt32,
+            DataType::Int64,
+            DataType::UInt64,
+            DataType::Float16,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::Date32,
+            DataType::Date64,
+            DataType::FixedSizeBinary(16),
+            // Nested
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, true))),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 128),
+            DataType::Struct(
+                vec![
+                    Field::new("a", DataType::Int64, false),
+                    Field::new("b", DataType::Utf8, true),
+                ]
+                .into(),
+            ),
+        ];
+
+        for dt in &cases {
+            let json = arrow_type_to_json(dt)
+                .unwrap_or_else(|e| panic!("arrow_type_to_json failed for {:?}: {}", dt, e));
+            let back = convert_json_arrow_type(&json)
+                .unwrap_or_else(|e| panic!("convert_json_arrow_type failed for {:?}: {}", dt, e));
+            assert_eq!(
+                &back, dt,
+                "Roundtrip mismatch for {:?}: got {:?}",
+                dt, back
+            );
+        }
     }
 }
