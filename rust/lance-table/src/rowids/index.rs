@@ -650,6 +650,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_large_range_segments_with_deletions() {
+        let rows_per_fragment = 1_000u64;
+        let num_fragments = 10u32;
+        let mut offset = 0u64;
+
+        let fragment_indices: Vec<FragmentRowIdIndex> = (0..num_fragments)
+            .map(|frag_id| {
+                let start = offset;
+                offset += rows_per_fragment;
+
+                // Delete every 3rd row (offsets 0, 3, 6, ...) within each fragment.
+                let mut deleted = roaring::RoaringBitmap::new();
+                for i in (0..rows_per_fragment as u32).step_by(3) {
+                    deleted.insert(i);
+                }
+
+                FragmentRowIdIndex {
+                    fragment_id: frag_id,
+                    row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Range(
+                        start..start + rows_per_fragment,
+                    )])),
+                    deletion_vector: Arc::new(DeletionVector::Bitmap(deleted)),
+                }
+            })
+            .collect();
+
+        let index = RowIdIndex::new(&fragment_indices).unwrap();
+
+        // Deleted rows (offset 0, 3, 6, ...) should not be found.
+        // Row ID 0 has offset 0 in fragment 0 -> deleted.
+        assert_eq!(index.get(0), None);
+        // Row ID 3 has offset 3 in fragment 0 -> deleted.
+        assert_eq!(index.get(3), None);
+
+        // Non-deleted rows should resolve correctly.
+        // Row ID 1 has offset 1 in fragment 0 -> address (frag=0, row=1).
+        assert_eq!(index.get(1), Some(RowAddress::new_from_parts(0, 1)));
+        // Row ID 2 has offset 2 in fragment 0 -> address (frag=0, row=2).
+        assert_eq!(index.get(2), Some(RowAddress::new_from_parts(0, 2)));
+        // Row ID 4 has offset 4 in fragment 0 -> address (frag=0, row=4).
+        assert_eq!(index.get(4), Some(RowAddress::new_from_parts(0, 4)));
+
+        // Check second fragment: row IDs start at 1000.
+        // Row ID 1000 has offset 0 in fragment 1 -> deleted.
+        assert_eq!(index.get(rows_per_fragment), None);
+        // Row ID 1001 has offset 1 in fragment 1 -> address (frag=1, row=1).
+        assert_eq!(
+            index.get(rows_per_fragment + 1),
+            Some(RowAddress::new_from_parts(1, 1))
+        );
+
+        // Last fragment, last non-deleted row.
+        // Row ID 9999 has offset 999 in fragment 9 -> 999 % 3 == 0 -> deleted.
+        let last_row = num_fragments as u64 * rows_per_fragment - 1;
+        assert_eq!(index.get(last_row), None);
+        // Row ID 9998 has offset 998 -> 998 % 3 == 2 -> not deleted.
+        assert_eq!(
+            index.get(last_row - 1),
+            Some(RowAddress::new_from_parts(num_fragments - 1, 998))
+        );
+
+        // Out of range.
+        assert_eq!(index.get(last_row + 1), None);
+    }
+
     proptest::proptest! {
         #[test]
         fn test_new_index_robustness(row_ids in arbitrary_row_ids(0..5, 0..32)) {
