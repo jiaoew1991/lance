@@ -107,11 +107,8 @@ fn decompose_sequence(
             let segment_len = segment.len();
 
             let result = if no_deletions {
-                // Fast path: no deletions, avoid per-row iteration.
-                // Directly construct index chunks from the segment metadata.
                 decompose_segment_no_deletions(segment, start_address)
             } else {
-                // Slow path: has deletions, must check each row.
                 decompose_segment_with_deletions(
                     segment,
                     start_address,
@@ -125,98 +122,67 @@ fn decompose_sequence(
 
             result
         })
-        .flatten()
         .collect()
 }
 
-/// Fast path: decompose a segment when there are no deletions.
-/// This avoids iterating over every row and instead operates on segment
-/// metadata directly, reducing complexity from O(rows) to O(1) for Range
-/// segments.
+/// Build an IndexChunk from a list of (row_id, address) pairs.
+fn build_chunk_from_pairs(pairs: Vec<(u64, u64)>) -> Option<IndexChunk> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let (row_ids, addresses): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
+    let row_id_segment = U64Segment::from_iter(row_ids);
+    let address_segment = U64Segment::from_iter(addresses);
+    let coverage = row_id_segment.range()?;
+    Some((coverage, (row_id_segment, address_segment)))
+}
+
+/// Fast path: no deletions. O(1) for Range segments.
 fn decompose_segment_no_deletions(
     segment: &U64Segment,
     start_address: u64,
-) -> Option<Vec<(RangeInclusive<u64>, (U64Segment, U64Segment))>> {
+) -> Option<IndexChunk> {
     match segment {
-        U64Segment::Range(range) => {
-            if range.is_empty() {
-                return None;
-            }
-            // Row IDs are range.start..range.end, addresses are start_address..start_address+len.
-            // Both are contiguous ranges, so we can construct them directly in O(1).
+        U64Segment::Range(range) if !range.is_empty() => {
             let len = range.end - range.start;
             let row_id_segment = U64Segment::Range(range.clone());
             let address_segment = U64Segment::Range(start_address..start_address + len);
             let coverage = range.start..=range.end - 1;
-            Some(vec![(coverage, (row_id_segment, address_segment))])
+            Some((coverage, (row_id_segment, address_segment)))
         }
+        _ if segment.is_empty() => None,
         _ => {
-            // For non-Range segments (RangeWithHoles, RangeWithBitmap, SortedArray, Array),
-            // the address mapping is non-trivial (addresses use positional offsets within
-            // the original range, not within the active set). Fall back to per-element iteration.
-            // This is still fast since there are no deletions to check.
-            let segment_len = segment.len();
-            if segment_len == 0 {
-                return None;
-            }
-
-            let active_pairs: Vec<(u64, u64)> = segment
+            // Non-Range segments: must iterate to build address mapping.
+            let pairs: Vec<(u64, u64)> = segment
                 .iter()
                 .enumerate()
-                .map(|(i, row_id)| {
-                    let address = start_address + i as u64;
-                    (row_id, address)
-                })
+                .map(|(i, row_id)| (row_id, start_address + i as u64))
                 .collect();
-
-            let row_ids: Vec<u64> = active_pairs.iter().map(|(rid, _)| *rid).collect();
-            let addresses: Vec<u64> = active_pairs.iter().map(|(_, addr)| *addr).collect();
-
-            let row_id_segment = U64Segment::from_iter(row_ids.into_iter());
-            let address_segment = U64Segment::from_iter(addresses.into_iter());
-
-            let coverage = row_id_segment.range()?;
-
-            Some(vec![(coverage, (row_id_segment, address_segment))])
+            build_chunk_from_pairs(pairs)
         }
     }
 }
 
-/// Slow path: decompose a segment when there are deletions.
-/// Must check each row against the deletion vector.
+/// Slow path: has deletions, must check each row.
 fn decompose_segment_with_deletions(
     segment: &U64Segment,
     start_address: u64,
     current_offset: u32,
     deletion_vector: &DeletionVector,
-) -> Option<Vec<(RangeInclusive<u64>, (U64Segment, U64Segment))>> {
-    let active_pairs: Vec<(u64, u64)> = segment
+) -> Option<IndexChunk> {
+    let pairs: Vec<(u64, u64)> = segment
         .iter()
         .enumerate()
         .filter_map(|(i, row_id)| {
             let row_offset = current_offset + i as u32;
             if !deletion_vector.contains(row_offset) {
-                let address = start_address + i as u64;
-                Some((row_id, address))
+                Some((row_id, start_address + i as u64))
             } else {
                 None
             }
         })
         .collect();
-
-    if active_pairs.is_empty() {
-        return None;
-    }
-
-    let row_ids: Vec<u64> = active_pairs.iter().map(|(rid, _)| *rid).collect();
-    let addresses: Vec<u64> = active_pairs.iter().map(|(_, addr)| *addr).collect();
-
-    let row_id_segment = U64Segment::from_iter(row_ids.into_iter());
-    let address_segment = U64Segment::from_iter(addresses.into_iter());
-
-    let coverage = row_id_segment.range()?;
-
-    Some(vec![(coverage, (row_id_segment, address_segment))])
+    build_chunk_from_pairs(pairs)
 }
 
 type IndexChunk = (RangeInclusive<u64>, (U64Segment, U64Segment));
