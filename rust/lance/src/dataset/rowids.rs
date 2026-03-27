@@ -96,8 +96,8 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
     let fragment_map: std::collections::HashMap<u32, &crate::dataset::fragment::FileFragment> =
         fragments.iter().map(|f| (f.id() as u32, f)).collect();
 
-    let fragment_indices: Vec<_> = futures::stream::iter(sequences.into_iter().map(
-        |(fragment_id, sequence)| {
+    let fragment_indices: Vec<_> =
+        futures::stream::iter(sequences.into_iter().map(|(fragment_id, sequence)| {
             let fragment = fragment_map
                 .get(&fragment_id)
                 .expect("Fragment should exist");
@@ -119,11 +119,10 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
                     deletion_vector,
                 })
             }
-        },
-    ))
-    .buffer_unordered(dataset.object_store.io_parallelism())
-    .try_collect()
-    .await?;
+        }))
+        .buffer_unordered(dataset.object_store.io_parallelism())
+        .try_collect()
+        .await?;
 
     let index = RowIdIndex::new(&fragment_indices)?;
 

@@ -138,10 +138,7 @@ fn build_chunk_from_pairs(pairs: Vec<(u64, u64)>) -> Option<IndexChunk> {
 }
 
 /// Fast path: no deletions. O(1) for Range segments.
-fn decompose_segment_no_deletions(
-    segment: &U64Segment,
-    start_address: u64,
-) -> Option<IndexChunk> {
+fn decompose_segment_no_deletions(segment: &U64Segment, start_address: u64) -> Option<IndexChunk> {
     match segment {
         U64Segment::Range(range) if !range.is_empty() => {
             let len = range.end - range.start;
