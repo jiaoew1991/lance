@@ -97,6 +97,7 @@ fn decompose_sequence(
 ) -> Vec<(RangeInclusive<u64>, (U64Segment, U64Segment))> {
     let mut start_address: u64 = RowAddress::first_row(frag_index.fragment_id).into();
     let mut current_offset = 0u32;
+    let no_deletions = frag_index.deletion_vector.is_empty();
 
     frag_index
         .row_id_sequence
@@ -105,38 +106,117 @@ fn decompose_sequence(
         .filter_map(|segment| {
             let segment_len = segment.len();
 
-            let active_pairs: Vec<(u64, u64)> = segment
-                .iter()
-                .enumerate()
-                .filter_map(|(i, row_id)| {
-                    let row_offset = current_offset + i as u32;
-                    if !frag_index.deletion_vector.contains(row_offset) {
-                        let address = start_address + i as u64;
-                        Some((row_id, address))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let result = if no_deletions {
+                // Fast path: no deletions, avoid per-row iteration.
+                // Directly construct index chunks from the segment metadata.
+                decompose_segment_no_deletions(segment, start_address)
+            } else {
+                // Slow path: has deletions, must check each row.
+                decompose_segment_with_deletions(
+                    segment,
+                    start_address,
+                    current_offset,
+                    &frag_index.deletion_vector,
+                )
+            };
 
             current_offset += segment_len as u32;
             start_address += segment_len as u64;
 
-            if active_pairs.is_empty() {
+            result
+        })
+        .flatten()
+        .collect()
+}
+
+/// Fast path: decompose a segment when there are no deletions.
+/// This avoids iterating over every row and instead operates on segment
+/// metadata directly, reducing complexity from O(rows) to O(1) for Range
+/// segments.
+fn decompose_segment_no_deletions(
+    segment: &U64Segment,
+    start_address: u64,
+) -> Option<Vec<(RangeInclusive<u64>, (U64Segment, U64Segment))>> {
+    match segment {
+        U64Segment::Range(range) => {
+            if range.is_empty() {
                 return None;
             }
+            // Row IDs are range.start..range.end, addresses are start_address..start_address+len.
+            // Both are contiguous ranges, so we can construct them directly in O(1).
+            let len = range.end - range.start;
+            let row_id_segment = U64Segment::Range(range.clone());
+            let address_segment = U64Segment::Range(start_address..start_address + len);
+            let coverage = range.start..=range.end - 1;
+            Some(vec![(coverage, (row_id_segment, address_segment))])
+        }
+        _ => {
+            // For non-Range segments (RangeWithHoles, RangeWithBitmap, SortedArray, Array),
+            // the address mapping is non-trivial (addresses use positional offsets within
+            // the original range, not within the active set). Fall back to per-element iteration.
+            // This is still fast since there are no deletions to check.
+            let segment_len = segment.len();
+            if segment_len == 0 {
+                return None;
+            }
+
+            let active_pairs: Vec<(u64, u64)> = segment
+                .iter()
+                .enumerate()
+                .map(|(i, row_id)| {
+                    let address = start_address + i as u64;
+                    (row_id, address)
+                })
+                .collect();
 
             let row_ids: Vec<u64> = active_pairs.iter().map(|(rid, _)| *rid).collect();
             let addresses: Vec<u64> = active_pairs.iter().map(|(_, addr)| *addr).collect();
 
-            let row_id_segment = U64Segment::from_iter(row_ids.iter().copied());
-            let address_segment = U64Segment::from_iter(addresses.iter().copied());
+            let row_id_segment = U64Segment::from_iter(row_ids.into_iter());
+            let address_segment = U64Segment::from_iter(addresses.into_iter());
 
             let coverage = row_id_segment.range()?;
 
-            Some((coverage, (row_id_segment, address_segment)))
+            Some(vec![(coverage, (row_id_segment, address_segment))])
+        }
+    }
+}
+
+/// Slow path: decompose a segment when there are deletions.
+/// Must check each row against the deletion vector.
+fn decompose_segment_with_deletions(
+    segment: &U64Segment,
+    start_address: u64,
+    current_offset: u32,
+    deletion_vector: &DeletionVector,
+) -> Option<Vec<(RangeInclusive<u64>, (U64Segment, U64Segment))>> {
+    let active_pairs: Vec<(u64, u64)> = segment
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row_id)| {
+            let row_offset = current_offset + i as u32;
+            if !deletion_vector.contains(row_offset) {
+                let address = start_address + i as u64;
+                Some((row_id, address))
+            } else {
+                None
+            }
         })
-        .collect()
+        .collect();
+
+    if active_pairs.is_empty() {
+        return None;
+    }
+
+    let row_ids: Vec<u64> = active_pairs.iter().map(|(rid, _)| *rid).collect();
+    let addresses: Vec<u64> = active_pairs.iter().map(|(_, addr)| *addr).collect();
+
+    let row_id_segment = U64Segment::from_iter(row_ids.into_iter());
+    let address_segment = U64Segment::from_iter(addresses.into_iter());
+
+    let coverage = row_id_segment.range()?;
+
+    Some(vec![(coverage, (row_id_segment, address_segment))])
 }
 
 type IndexChunk = (RangeInclusive<u64>, (U64Segment, U64Segment));
@@ -545,6 +625,66 @@ mod tests {
                 sequences
             })
         })
+    }
+
+    #[test]
+    fn test_large_range_segments_no_deletions() {
+        // Simulates a real-world scenario: many fragments with large Range segments
+        // and no deletions. Before optimization, this would iterate over all rows
+        // (O(total_rows)). After optimization, it's O(num_fragments).
+        let rows_per_fragment = 250_000u64;
+        let num_fragments = 100u32;
+        let mut offset = 0u64;
+
+        let fragment_indices: Vec<FragmentRowIdIndex> = (0..num_fragments)
+            .map(|frag_id| {
+                let start = offset;
+                offset += rows_per_fragment;
+                FragmentRowIdIndex {
+                    fragment_id: frag_id,
+                    row_id_sequence: Arc::new(RowIdSequence(vec![U64Segment::Range(
+                        start..start + rows_per_fragment,
+                    )])),
+                    deletion_vector: Arc::new(DeletionVector::default()),
+                }
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let index = RowIdIndex::new(&fragment_indices).unwrap();
+        let elapsed = start.elapsed();
+
+        // Verify correctness at boundaries
+        assert_eq!(index.get(0), Some(RowAddress::new_from_parts(0, 0)));
+        assert_eq!(
+            index.get(rows_per_fragment - 1),
+            Some(RowAddress::new_from_parts(0, rows_per_fragment as u32 - 1))
+        );
+        assert_eq!(
+            index.get(rows_per_fragment),
+            Some(RowAddress::new_from_parts(1, 0))
+        );
+        let last_row = num_fragments as u64 * rows_per_fragment - 1;
+        assert_eq!(
+            index.get(last_row),
+            Some(RowAddress::new_from_parts(
+                num_fragments - 1,
+                rows_per_fragment as u32 - 1
+            ))
+        );
+        assert_eq!(index.get(last_row + 1), None);
+
+        // With the optimization, building an index for 25M rows across 100 fragments
+        // should complete in well under 1 second (typically < 1ms).
+        assert!(
+            elapsed.as_secs() < 1,
+            "Index build took {:?} for {} fragments x {} rows = {} total rows. \
+             This suggests the O(rows) -> O(fragments) optimization is not working.",
+            elapsed,
+            num_fragments,
+            rows_per_fragment,
+            num_fragments as u64 * rows_per_fragment,
+        );
     }
 
     proptest::proptest! {

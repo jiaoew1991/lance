@@ -92,19 +92,28 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
         .try_collect::<Vec<_>>()
         .await?;
 
-    let fragment_indices: Vec<_> =
-        futures::future::try_join_all(sequences.into_iter().map(|(fragment_id, sequence)| {
-            let dataset = dataset.clone();
-            async move {
-                let fragments = dataset.get_fragments();
-                let fragment = fragments
-                    .iter()
-                    .find(|f| f.id() as u32 == fragment_id)
-                    .expect("Fragment should exist");
+    // Build a lookup map for O(1) fragment access instead of O(N) linear search.
+    let fragments = dataset.get_fragments();
+    let fragment_map: std::collections::HashMap<u32, &crate::dataset::fragment::FileFragment> =
+        fragments.iter().map(|f| (f.id() as u32, f)).collect();
 
-                let deletion_vector = match fragment.get_deletion_vector().await {
-                    Ok(Some(dv)) => dv,
-                    Ok(None) | Err(_) => Arc::new(DeletionVector::default()),
+    // Load deletion vectors. Use buffered concurrency to avoid spawning all
+    // futures at once (which can overwhelm the runtime for large datasets).
+    let fragment_indices: Vec<_> = futures::stream::iter(sequences.into_iter().map(
+        |(fragment_id, sequence)| {
+            let fragment = fragment_map
+                .get(&fragment_id)
+                .expect("Fragment should exist");
+            let has_deletion_file = fragment.metadata().deletion_file.is_some();
+            let fragment_clone = (*fragment).clone();
+            async move {
+                let deletion_vector = if has_deletion_file {
+                    match fragment_clone.get_deletion_vector().await {
+                        Ok(Some(dv)) => dv,
+                        Ok(None) | Err(_) => Arc::new(DeletionVector::default()),
+                    }
+                } else {
+                    Arc::new(DeletionVector::default())
                 };
 
                 Ok::<FragmentRowIdIndex, Error>(FragmentRowIdIndex {
@@ -113,8 +122,11 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
                     deletion_vector,
                 })
             }
-        }))
-        .await?;
+        },
+    ))
+    .buffer_unordered(dataset.object_store.io_parallelism())
+    .try_collect()
+    .await?;
 
     let index = RowIdIndex::new(&fragment_indices)?;
 
