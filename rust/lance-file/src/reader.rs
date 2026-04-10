@@ -2352,7 +2352,7 @@ mod tests {
         use deepsize::DeepSizeOf;
 
         let fs = FsFixture::default();
-        let written = create_some_file(&fs, version).await;
+        let _written = create_some_file(&fs, version).await;
         let cache = test_cache();
         let file_scheduler = fs
             .scheduler
