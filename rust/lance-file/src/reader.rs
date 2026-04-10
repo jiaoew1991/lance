@@ -148,9 +148,7 @@ impl DeepSizeOf for CachedFileMetadata {
                     .iter()
                     .map(|pi| {
                         let enc_size = match &pi.encoding {
-                            lance_encoding::decoder::PageEncoding::Legacy(e) => {
-                                e.encoded_len() * 4
-                            }
+                            lance_encoding::decoder::PageEncoding::Legacy(e) => e.encoded_len() * 4,
                             lance_encoding::decoder::PageEncoding::Structural(e) => {
                                 e.encoded_len() * 4
                             }
@@ -2339,7 +2337,12 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_deep_size_of_includes_column_metadata(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)]
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
         version: LanceFileVersion,
     ) {
         // Regression test: CachedFileMetadata::deep_size_of must account for
